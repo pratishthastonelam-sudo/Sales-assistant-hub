@@ -1,0 +1,4 @@
+project_id = "sales-assistant-hub"
+
+[functions.process_chat_query]
+verify_jwt = false
