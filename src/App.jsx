@@ -2,9 +2,10 @@ import { useState } from 'react'
 import { useAuth } from './context/AuthContext.jsx'
 import LoginScreen from './components/LoginScreen.jsx'
 import ChatLayout from './components/ChatLayout.jsx'
+import ResetPasswordScreen from './components/ResetPasswordScreen.jsx'
 
 export default function App() {
-  const { session, loading } = useAuth()
+  const { session, loading, isPasswordRecovery } = useAuth()
 
   if (loading) {
     return (
@@ -15,6 +16,10 @@ export default function App() {
         </div>
       </div>
     )
+  }
+
+  if (isPasswordRecovery) {
+    return <ResetPasswordScreen />
   }
 
   if (!session) {

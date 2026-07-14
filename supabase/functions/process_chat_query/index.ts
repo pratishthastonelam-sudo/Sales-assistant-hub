@@ -60,7 +60,7 @@ const CORS_HEADERS = {
 
 let cachedFiles: any[] = []
 let cacheTime = 0
-const CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+const CACHE_TTL = 30 * 60 * 1000 // 30 minutes — recursive folder traversal is expensive, so cache longer
 
 async function getDriveFiles() {
   const now = Date.now()
@@ -96,21 +96,20 @@ ${fileContext}`
 
   const userPrompt = `User query: "${prompt}"`
 
-  const resp = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ parts: [{ text: userPrompt }] }],
-        generationConfig: {
-          temperature: 0.3,
-          maxOutputTokens: 300,
-        },
-      }),
-    }
-  )
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ parts: [{ text: userPrompt }] }],
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 300,
+      },
+    }),
+  })
 
   if (!resp.ok) {
     console.error('[Gemini] Error:', resp.status, await resp.text())
@@ -127,6 +126,7 @@ ${fileContext}`
 interface ProcessResult {
   response: string
   media_urls: any[]
+  video_urls: any[]
   documents: any[]
 }
 
@@ -139,13 +139,21 @@ async function processQuery(message: string, _userId?: string): Promise<ProcessR
   const confident = hasConfidentMatch(message, allFiles)
 
   // Step 3: Categorize matches
-  const { images, documents } = categorizeFiles(matchedFiles)
+  const { images, videos, documents } = categorizeFiles(matchedFiles)
 
-  // Step 4: Format media + document results
+  // Step 4: Format media + video + document results
   const mediaResults = images.slice(0, 10).map((f: any) => ({
     name: f.name,
     url: getFileDownloadUrl(f),
     thumbnail: f.thumbnailLink || getImageUrl(f),
+    web_view_link: getFileViewUrl(f),
+  }))
+
+  const videoResults = videos.slice(0, 5).map((f: any) => ({
+    name: f.name,
+    mime_type: f.mimeType,
+    url: getFileDownloadUrl(f),
+    thumbnail: f.thumbnailLink || null,
     web_view_link: getFileViewUrl(f),
   }))
 
@@ -197,6 +205,7 @@ async function processQuery(message: string, _userId?: string): Promise<ProcessR
   return {
     response: responseText,
     media_urls: mediaResults,
+    video_urls: videoResults,
     documents: docResults,
   }
 }
@@ -336,9 +345,10 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({
           response: result.response,
           media_urls: result.media_urls,
+          video_urls: result.video_urls,
           documents: result.documents,
           meta: {
-            matched_count: result.media_urls.length + result.documents.length,
+            matched_count: result.media_urls.length + result.video_urls.length + result.documents.length,
             session_id: sessionId,
           },
         }),
@@ -350,7 +360,7 @@ Deno.serve(async (req: Request) => {
     return new Response(
       JSON.stringify({
         error: 'Internal server error',
-        message: error.message,
+        message: (error as Error).message,
       }),
       { status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' } }
     )

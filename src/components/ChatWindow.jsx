@@ -65,6 +65,7 @@ export default function ChatWindow({
         role: row.role,
         content: row.content,
         media: row.media || [],
+        videos: row.videos || [],
         documents: row.documents || [],
         created_at: row.created_at,
       }))
@@ -80,7 +81,7 @@ export default function ChatWindow({
       voiceEnabledRef.current = true
     }
 
-    const userMessage = { role: 'user', content: text.trim(), media: [], documents: [] }
+    const userMessage = { role: 'user', content: text.trim(), media: [], videos: [], documents: [] }
     setMessages((prev) => [...prev, userMessage])
     setInput('')
     setLoading(true)
@@ -149,6 +150,7 @@ export default function ChatWindow({
         role: 'assistant',
         content: data.response || data.text || 'No response received.',
         media: data.media_urls || data.media || [],
+        videos: data.video_urls || data.videos || [],
         documents: data.documents || data.files || [],
       }
 
@@ -166,6 +168,7 @@ export default function ChatWindow({
         role: 'assistant',
         content: aiMessage.content,
         media: aiMessage.media,
+        videos: aiMessage.videos,
         documents: aiMessage.documents,
       })
     } catch (err) {
@@ -175,6 +178,7 @@ export default function ChatWindow({
         content:
           'Sorry, I encountered an error processing your request. Please try again.',
         media: [],
+        videos: [],
         documents: [],
       }
       setMessages((prev) => [...prev, errorMessage])

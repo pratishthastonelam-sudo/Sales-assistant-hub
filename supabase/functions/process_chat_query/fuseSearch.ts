@@ -42,11 +42,6 @@ function createFuseIndex(files: DriveFile[]): Fuse<DriveFile> {
   })
 }
 
-/**
- * Split a user query into search terms and run fuzzy search on each.
- * This handles multi-word queries like "delhi marble slab" — each word
- * gets fuzzy-matched independently, then we intersect/deduplicate results.
- */
 export function fuzzySearch(
   query: string,
   files: DriveFile[],

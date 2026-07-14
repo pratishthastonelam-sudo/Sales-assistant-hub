@@ -101,6 +101,30 @@ export default function ChatMessage({ message }) {
             </div>
           )}
 
+          {/* Video results */}
+          {!isUser && message.videos && message.videos.length > 0 && (
+            <div className="mt-3 space-y-2">
+              {message.videos.map((vid, idx) => (
+                <div key={idx} className="overflow-hidden rounded-xl ring-1 ring-gray-200">
+                  <video
+                    controls
+                    preload="metadata"
+                    poster={vid.thumbnail || undefined}
+                    className="max-h-80 w-full bg-black"
+                  >
+                    <source src={vid.url} type={vid.mime_type || 'video/mp4'} />
+                    Your browser doesn't support inline video playback.
+                  </video>
+                  {vid.name && (
+                    <p className="truncate bg-white px-2 py-1 text-xs text-gray-500">
+                      {vid.name}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* Document pills */}
           {!isUser && message.documents && message.documents.length > 0 && (
             <div className="mt-3 flex flex-wrap gap-2">
