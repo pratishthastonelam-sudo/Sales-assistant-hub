@@ -10,10 +10,11 @@ export function AuthProvider({ children }) {
 
   useEffect(() => {
     // Get initial session
-    supabase.auth.getSession().then(({ data }) => {
-      setSession(data.session)
-      setLoading(false)
-    })
+    supabase.auth
+      .getSession()
+      .then(({ data }) => setSession(data.session))
+      .catch((err) => console.error('[Sales Assistant Hub] getSession failed:', err))
+      .finally(() => setLoading(false))
 
     // Listen for auth changes
     const {

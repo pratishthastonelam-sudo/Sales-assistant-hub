@@ -18,6 +18,10 @@ Deno.serve(async (req) => {
 
   const url = new URL(req.url)
   const fileId = url.searchParams.get('fileId')
+  // ?thumb=800 returns a small preview (Drive thumbnail) instead of the full file,
+  // so chat previews don't pull 25MB originals or whole videos.
+  const thumb = url.searchParams.get('thumb')
+  const download = url.searchParams.get('download') === '1'
 
   if (!fileId) {
     return new Response('Missing fileId', { status: 400, headers: CORS_HEADERS })
@@ -40,6 +44,31 @@ Deno.serve(async (req) => {
     //    Forward the browser's Range header (used for video seeking/
     //    scrubbing) so Drive can return partial content instead of the
     //    whole file every time.
+    if (thumb) {
+      const metaResp = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}?fields=thumbnailLink&supportsAllDrives=true`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
+      const link = metaResp.ok ? (await metaResp.json()).thumbnailLink : null
+      if (link) {
+        const size = Math.min(Math.max(parseInt(thumb) || 800, 100), 1600)
+        const thumbResp = await fetch(link.replace(/=s\d+$/, `=s${size}`), {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (thumbResp.ok) {
+          return new Response(thumbResp.body, {
+            headers: {
+              ...CORS_HEADERS,
+              'Content-Type': thumbResp.headers.get('Content-Type') || 'image/jpeg',
+              'Cache-Control': 'public, max-age=86400',
+            },
+          })
+        }
+      }
+      // No thumbnail (e.g. huge TIFFs): don't stream the multi-hundred-MB original as a "preview"
+      return new Response('No preview available', { status: 404, headers: CORS_HEADERS })
+    }
+
     const driveHeaders: Record<string, string> = { Authorization: `Bearer ${token}` }
     const rangeHeader = req.headers.get('Range')
     if (rangeHeader) {
@@ -61,8 +90,8 @@ Deno.serve(async (req) => {
 
     // 3. Stream the file back with the correct headers for browser
     //    rendering/playback. Preserve 206 Partial Content + range headers
-    //    when Drive returns them (needed for video scrubbing).
-    const buffer = await driveResp.arrayBuffer()
+    //    when Drive returns them (needed for video scrubbing). Streamed rather
+    //    than buffered so large videos and brochures don't exhaust memory.
     const responseHeaders: Record<string, string> = {
       ...CORS_HEADERS,
       'Content-Type': driveResp.headers.get('Content-Type') || 'application/octet-stream',
@@ -76,7 +105,16 @@ Deno.serve(async (req) => {
     const contentLength = driveResp.headers.get('Content-Length')
     if (contentLength) responseHeaders['Content-Length'] = contentLength
 
-    return new Response(buffer, {
+    if (download) {
+      const nameResp = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${fileId}?fields=name&supportsAllDrives=true`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
+      const name = nameResp.ok ? (await nameResp.json()).name : fileId
+      responseHeaders['Content-Disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(name)}`
+    }
+
+    return new Response(driveResp.body, {
       status: driveResp.status === 206 ? 206 : 200,
       headers: responseHeaders,
     })

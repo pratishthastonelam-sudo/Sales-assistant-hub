@@ -6,49 +6,57 @@
  *  This function is intentionally dual-purpose:
  *
  *  1. WEB UI: Receives POST { message, user_id, session_id }
- *     → Returns { response, media_urls, documents }
+ *     → Returns { response, media_urls, video_urls, documents }
  *
  *  2. WHATSAPP WEBHOOK (ready for Meta Business API):
  *     - GET  → Verification challenge (Meta webhook setup)
  *     - POST → WhatsApp message payload
  *       → Returns WhatsApp-formatted text response with media URLs
  *
- *  The search pipeline:
- *    a) Fetch Google Drive files (cached)
- *    b) Fuse.js fuzzy search (typo correction — credit saver)
- *    c) If confident match → return files directly (NO LLM call)
- *    d) If ambiguous → call LLM with file context (saves credits)
+ *  The search pipeline (knowledge base in Supabase, see 002_knowledge_base.sql,
+ *  plus the Google Drive "Sales Kit" index, see 003_drive_index.sql):
+ *    a) Embed the question with Gemini (gemini-embedding-001 @ 768)
+ *    b) match_kb hybrid search (vector + full-text) — once for text
+ *       knowledge (facts, Q&As, projects, expert answers, text of Drive
+ *       PDFs/decks), once for media
+ *    c) match_drive keyword search over Drive file names and folder paths
+ *       (the drive_sync function keeps that index up to date)
+ *    d) Gemini writes the answer from that context only and picks which
+ *       photos/videos/Drive files fit; KB photos are served via signed URLs
+ *       (bucket kb-media), Drive files through the get-image proxy
+ *    e) Questions the knowledge base cannot answer go to kb_pending_questions
+ *       for an expert to answer later
  *
  *  Deploy:
  *    supabase functions deploy process_chat_query
+ *    supabase secrets set GEMINI_API_KEY=...
  *    supabase secrets set GOOGLE_DRIVE_FOLDER_ID=...
  *    supabase secrets set GOOGLE_SERVICE_ACCOUNT_JSON='...'
- *    supabase secrets set GEMINI_API_KEY=...
  *    supabase secrets set WHATSAPP_VERIFY_TOKEN=...
+ *    (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided automatically)
  * ═══════════════════════════════════════════════════════════════
  */
 
-import {
-  listDriveFiles,
-  categorizeFiles,
-  getImageUrl,
-  getFileViewUrl,
-  getFileDownloadUrl,
-} from './googleDrive.ts'
-import {
-  fuzzySearch,
-  hasConfidentMatch,
-  formatFileContext,
-} from './fuseSearch.ts'
 
 // ── Environment ──────────────────────────────────────────
 
-const FOLDER_ID = Deno.env.get('GOOGLE_DRIVE_FOLDER_ID') ?? ''
-const SA_JSON = Deno.env.get('GOOGLE_SERVICE_ACCOUNT_JSON') ?? ''
-const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY') ?? ''
-const WHATSAPP_VERIFY_TOKEN = Deno.env.get('WHATSAPP_VERIFY_TOKEN') ?? 'sales_assistant_verify'
-const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? ''
-const SUPABASE_SERVICE_ROLE = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+// Values pasted into secrets sometimes keep wrapping <> or quotes
+const env = (name: string, fallback = '') =>
+  (Deno.env.get(name) ?? fallback).trim().replace(/^[<"' ]+|[>"' ]+$/g, '')
+
+const GEMINI_API_KEY = env('GEMINI_API_KEY')
+const WHATSAPP_VERIFY_TOKEN = env('WHATSAPP_VERIFY_TOKEN', 'sales_assistant_verify')
+const SUPABASE_URL = env('SUPABASE_URL').replace(/\/$/, '')
+const SUPABASE_SERVICE_ROLE = env('SUPABASE_SERVICE_ROLE_KEY')
+
+// The "-latest" alias follows Google's current Flash-Lite, so it doesn't get retired
+// under us like gemini-1.5-flash did. Lite answers in ~2s; full Flash took 30-140s in tests.
+const CHAT_MODELS = [env('GEMINI_MODEL', 'gemini-flash-lite-latest'), 'gemini-2.5-flash-lite']
+const LLM_TIMEOUT = 20 * 1000
+const EMBED_MODEL = 'gemini-embedding-001'
+const EMBED_DIM = 768
+const MEDIA_BUCKET = 'kb-media'
+const SIGNED_URL_TTL = 7 * 24 * 60 * 60 // 7 days, so links in saved chats keep working a while
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -56,69 +64,291 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey',
 }
 
-// ── Drive file cache (in-memory, refreshes every 5 min) ──
-
-let cachedFiles: any[] = []
-let cacheTime = 0
-const CACHE_TTL = 30 * 60 * 1000 // 30 minutes — recursive folder traversal is expensive, so cache longer
-
-async function getDriveFiles() {
-  const now = Date.now()
-  if (cachedFiles.length > 0 && now - cacheTime < CACHE_TTL) {
-    return cachedFiles
-  }
-
-  if (!FOLDER_ID || !SA_JSON) {
-    throw new Error('Google Drive not configured. Set GOOGLE_DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON secrets.')
-  }
-
-  const sa = JSON.parse(SA_JSON)
-  cachedFiles = await listDriveFiles(FOLDER_ID, sa)
-  cacheTime = now
-  console.log(`[Drive] Fetched ${cachedFiles.length} files from folder ${FOLDER_ID}`)
-  return cachedFiles
+const DB_HEADERS = {
+  'Content-Type': 'application/json',
+  apikey: SUPABASE_SERVICE_ROLE,
+  Authorization: `Bearer ${SUPABASE_SERVICE_ROLE}`,
 }
 
-// ── LLM call (Gemini) ────────────────────────────────────
+// ── Drive index search ───────────────────────────────────
 
-async function callGemini(prompt: string, fileContext: string): Promise<string> {
-  if (!GEMINI_API_KEY) {
-    // Fallback: return a simple summary if no LLM is configured
-    return `I found relevant files for your query "${prompt}". Here are the results from the Drive:`
+interface DriveHit {
+  id: string
+  name: string
+  mime_type: string
+  kind: 'image' | 'video' | 'document' | 'folder'
+  path: string | null
+  web_view_link: string | null
+  size: number | null
+  duration_ms: number | null
+  score: number
+}
+
+// Chat filler and "what kind of file" words. Kind words steer which file types rank first;
+// none of them should count as a search term, or "photos" would match every photo folder.
+const FILLER = new Set(('a an the of for in on at to and or with me us my our you your i we can could would please pls ' +
+  'kindly share send show give get need want find any some all have has is are do does there this that these those ' +
+  'from about related regarding latest new hi hello hey sir mam maam').split(' '))
+const KIND_WORDS: Record<string, DriveHit['kind']> = {
+  photo: 'image', photos: 'image', pic: 'image', pics: 'image', picture: 'image', pictures: 'image', image: 'image',
+  images: 'image', img: 'image', render: 'image', renders: 'image',
+  video: 'video', videos: 'video', reel: 'video', reels: 'video', film: 'video', clip: 'video', clips: 'video',
+  pdf: 'document', pdfs: 'document', doc: 'document', docs: 'document', document: 'document', documents: 'document',
+  brochure: 'document', brochures: 'document', catalogue: 'document', catalogues: 'document', catalog: 'document',
+  catalogs: 'document', deck: 'document', ppt: 'document', presentation: 'document', certificate: 'document',
+  certificates: 'document', sheet: 'document', datasheet: 'document', report: 'document', manual: 'document',
+  guide: 'document', sop: 'document', file: 'document', files: 'document',
+}
+// Kind words that are also real file/folder names (Catalogues, Certifications, Technical Sheet...) stay searchable
+const KIND_WORDS_SEARCHABLE = new Set(['brochure', 'brochures', 'catalogue', 'catalogues', 'catalog', 'catalogs',
+  'certificate', 'certificates', 'sheet', 'report', 'manual', 'guide', 'sop', 'deck', 'presentation', 'render', 'renders'])
+
+function parseDriveQuery(message: string) {
+  const words = message.toLowerCase().replace(/[^a-z0-9+\s]/g, ' ').split(/\s+/).filter(Boolean)
+  const kinds = new Set<DriveHit['kind']>()
+  const terms: string[] = []
+  for (const w of words) {
+    if (KIND_WORDS[w]) kinds.add(KIND_WORDS[w])
+    if (FILLER.has(w) || (KIND_WORDS[w] && !KIND_WORDS_SEARCHABLE.has(w))) continue
+    terms.push(w)
   }
+  return { terms: terms.join(' '), kinds: [...kinds] }
+}
 
-  const systemPrompt = `You are a helpful Sales Assistant. A sales team member is looking for information.
-Based on the user's query and the Google Drive files found, provide a concise, professional response.
-Reference specific files by name when relevant. Keep it under 3 sentences.
+async function searchDrive(message: string): Promise<DriveHit[]> {
+  const { terms, kinds } = parseDriveQuery(message)
+  if (!terms) return []
+  try {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_drive`, {
+      method: 'POST',
+      headers: DB_HEADERS,
+      body: JSON.stringify({ query_text: terms, kinds: null, match_count: 60 }),
+      signal: AbortSignal.timeout(8 * 1000),
+    })
+    if (!resp.ok) throw new Error(`match_drive ${resp.status}: ${await resp.text()}`)
+    const hits: DriveHit[] = await resp.json()
+    // The same photo often sits in several folders; keep the best-scoring copy.
+    const seen = new Set<string>()
+    const unique = hits.filter((h) => {
+      const key = `${h.kind}:${h.name.toLowerCase()}`
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    // Asked for photos/videos/documents: those types first, others after
+    if (kinds.length > 0) {
+      unique.sort((a, b) => Number(kinds.includes(b.kind)) - Number(kinds.includes(a.kind)) || b.score - a.score)
+    }
+    return unique.slice(0, 30)
+  } catch (e) {
+    console.error('[Drive] Search skipped:', (e as Error).message)
+    return []
+  }
+}
 
-Available files:
-${fileContext}`
+function driveLine(f: DriveHit, i: number): string {
+  const where = f.path ? `${f.path}/` : ''
+  const extra = f.kind === 'video' && f.duration_ms ? ` (${Math.round(f.duration_ms / 1000)}s)` : ''
+  return `[${i}] ${f.kind} | ${where}${f.name}${extra}`
+}
 
-  const userPrompt = `User query: "${prompt}"`
+function proxyUrl(fileId: string, params = '') {
+  return `${SUPABASE_URL}/functions/v1/get-image?fileId=${fileId}${params}`
+}
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`
+function driveViewUrl(f: DriveHit) {
+  if (f.web_view_link) return f.web_view_link
+  return f.kind === 'folder'
+    ? `https://drive.google.com/drive/folders/${f.id}`
+    : `https://drive.google.com/file/d/${f.id}/view`
+}
 
-  const resp = await fetch(url, {
+// ── Gemini ───────────────────────────────────────────────
+
+async function embedQuery(text: string): Promise<number[] | null> {
+  if (!GEMINI_API_KEY) return null
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBED_MODEL}:embedContent?key=${GEMINI_API_KEY}`
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: `models/${EMBED_MODEL}`,
+        content: { parts: [{ text }] },
+        taskType: 'RETRIEVAL_QUERY',
+        outputDimensionality: EMBED_DIM,
+      }),
+      signal: AbortSignal.timeout(10 * 1000),
+    })
+    if (!resp.ok) {
+      console.error('[Gemini embed] Error:', resp.status, await resp.text())
+      return null // full-text search still works without the vector
+    }
+    const data = await resp.json()
+    return data?.embedding?.values ?? null
+  } catch (e) {
+    console.error('[Gemini embed] Failed:', e)
+    return null
+  }
+}
+
+interface LlmAnswer {
+  answer: string
+  answered: boolean
+  media_ids: number[]
+  drive_ids?: number[]
+}
+
+const ANSWER_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    answer: { type: 'STRING' },
+    answered: { type: 'BOOLEAN' },
+    media_ids: { type: 'ARRAY', items: { type: 'INTEGER' } },
+    drive_ids: { type: 'ARRAY', items: { type: 'INTEGER' } },
+  },
+  required: ['answer', 'answered', 'media_ids', 'drive_ids'],
+}
+
+async function callGemini(question: string, knowledge: string, media: string, drive: string): Promise<LlmAnswer | null> {
+  if (!GEMINI_API_KEY) return null
+
+  const systemPrompt = `You are the Stonelam Sales Assistant. Stonelam makes large porcelain slabs for facades, flooring, walls, kitchens and furniture. Sales team members ask you about shades, applications, projects, technical details and ask for photos, videos, brochures, catalogues, certificates and other files from the company Drive.
+
+Rules:
+- Answer ONLY from the knowledge and media lists below. Never invent shades, projects, sizes or specs.
+- Never share prices, rates, phone numbers or email addresses, even if they appear in the knowledge. For price questions, say prices come from the regional sales head or the current price list, and set "answered" to true.
+- Be short and practical: 1-4 sentences, plain language. Name shades and projects when relevant.
+- Set "answered" to false if the knowledge does not actually answer the question; then say briefly that you don't have this yet and that you've passed it to the product team.
+- In "media_ids", list ids of photos/videos from "Photos and videos" that genuinely match the request (best first, at most 8). Use an empty list if none fit or photos would not help.
+- In "drive_ids", list ids from "Drive files" that genuinely match the request (best first, at most 8): the brochure, catalogue, certificate, sheet, deck, video or photos asked for, plus any document the answer came from. Folder paths tell you the shade, thickness, city or application (e.g. "Application/3mm/Oxide Moro/Exterior"). If a whole folder fits better than single files, include the folder. Use an empty list if nothing fits.
+- If the files themselves answer the request (e.g. "send the kitchen brochure"), say briefly what you are sharing and set "answered" to true.
+
+Knowledge:
+${knowledge || '(nothing relevant found)'}
+
+Photos and videos:
+${media || '(none found)'}
+
+Drive files:
+${drive || '(none found)'}`
+
+  for (const model of CHAT_MODELS) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(LLM_TIMEOUT),
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ role: 'user', parts: [{ text: question }] }],
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 1024,
+            responseMimeType: 'application/json',
+            responseSchema: ANSWER_SCHEMA,
+          },
+        }),
+      })
+      if (!resp.ok) {
+        console.error(`[Gemini ${model}] Error:`, resp.status, await resp.text())
+        continue
+      }
+      const data = await resp.json()
+      const text = data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text ?? '').join('')
+      const parsed = JSON.parse(text)
+      if (typeof parsed?.answer === 'string') return parsed as LlmAnswer
+    } catch (e) {
+      console.error(`[Gemini ${model}] Failed:`, e)
+    }
+  }
+  return null
+}
+
+// ── Knowledge base (Supabase) ────────────────────────────
+
+interface KbItem {
+  id: number
+  kind: string
+  title: string | null
+  body: string
+  shades: string[]
+  applications: string[]
+  media_path: string | null
+  media_type: string | null
+  meta: any
+  score: number
+}
+
+async function matchKb(query: string, embedding: number[] | null, kinds: string[], count: number): Promise<KbItem[]> {
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_kb`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: DB_HEADERS,
     body: JSON.stringify({
-      system_instruction: { parts: [{ text: systemPrompt }] },
-      contents: [{ parts: [{ text: userPrompt }] }],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 300,
-      },
+      query_text: query,
+      query_embedding: embedding ? `[${embedding.join(',')}]` : null,
+      match_count: count,
+      kinds,
     }),
   })
+  if (!resp.ok) throw new Error(`match_kb ${resp.status}: ${await resp.text()}`)
+  return await resp.json()
+}
 
+async function signMedia(paths: string[]): Promise<Record<string, string>> {
+  if (paths.length === 0) return {}
+  const resp = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${MEDIA_BUCKET}`, {
+    method: 'POST',
+    headers: DB_HEADERS,
+    body: JSON.stringify({ expiresIn: SIGNED_URL_TTL, paths }),
+  })
   if (!resp.ok) {
-    console.error('[Gemini] Error:', resp.status, await resp.text())
-    return `I found relevant files for "${prompt}". Please check the results below.`
+    console.error('[Storage] Sign failed:', resp.status, await resp.text())
+    return {}
   }
+  const out: Record<string, string> = {}
+  for (const r of await resp.json()) {
+    const signed = r.signedURL || r.signedUrl
+    if (r.path && signed) out[r.path] = `${SUPABASE_URL}/storage/v1${signed}`
+  }
+  return out
+}
 
-  const data = await resp.json()
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text
-  return text || `I found files matching "${prompt}". See results below.`
+function mediaLine(m: KbItem): string {
+  const ai = m.meta?.ai ?? {}
+  const bits = [
+    m.media_type,
+    m.title,
+    m.shades?.length ? `shades: ${m.shades.join(', ')}` : '',
+    m.applications?.length ? `applications: ${m.applications.join(', ')}` : '',
+    ai.building_type ? `building: ${ai.building_type}` : '',
+  ].filter(Boolean)
+  return `[${m.id}] ${bits.join(' | ')}`
+}
+
+async function logQuery(message: string, matched: number, answered: boolean, usedLlm: boolean) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/chat_logs`, {
+      method: 'POST',
+      headers: DB_HEADERS,
+      body: JSON.stringify({ query: message, matched_count: matched, confident: answered, used_llm: usedLlm }),
+    })
+  } catch (e) {
+    console.error('[Supabase] Failed to log query:', e)
+  }
+}
+
+async function savePendingQuestion(question: string, askedBy: string, channel: string) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/kb_pending_questions`, {
+      method: 'POST',
+      headers: DB_HEADERS,
+      body: JSON.stringify({ question, asked_by: askedBy || null, channel }),
+    })
+  } catch (e) {
+    console.error('[Supabase] Failed to save pending question:', e)
+  }
 }
 
 // ── Main processing logic ────────────────────────────────
@@ -130,77 +360,105 @@ interface ProcessResult {
   documents: any[]
 }
 
-async function processQuery(message: string, _userId?: string): Promise<ProcessResult> {
-  // Step 1: Fetch Drive files (cached)
-  const allFiles = await getDriveFiles()
-
-  // Step 2: Fuse.js fuzzy search (typo correction)
-  const matchedFiles = fuzzySearch(message, allFiles, 20)
-  const confident = hasConfidentMatch(message, allFiles)
-
-  // Step 3: Categorize matches
-  const { images, videos, documents } = categorizeFiles(matchedFiles)
-
-  // Step 4: Format media + video + document results
-  const mediaResults = images.slice(0, 10).map((f: any) => ({
-    name: f.name,
-    url: getFileDownloadUrl(f),
-    thumbnail: f.thumbnailLink || getImageUrl(f),
-    web_view_link: getFileViewUrl(f),
-  }))
-
-  const videoResults = videos.slice(0, 5).map((f: any) => ({
-    name: f.name,
-    mime_type: f.mimeType,
-    url: getFileDownloadUrl(f),
-    thumbnail: f.thumbnailLink || null,
-    web_view_link: getFileViewUrl(f),
-  }))
-
-  const docResults = documents.slice(0, 10).map((f: any) => ({
-    name: f.name,
-    mime_type: f.mimeType,
-    url: getFileDownloadUrl(f),
-    web_view_link: getFileViewUrl(f),
-  }))
-
-  // Step 5: Generate response text
-  let responseText: string
-
-  if (matchedFiles.length === 0) {
-    // No matches found — no LLM call needed (credit saver)
-    responseText = `I couldn't find any files matching "${message}" in the Drive. Could you try rephrasing or check if the file exists?`
-  } else if (confident && matchedFiles.length <= 5) {
-    // Confident match — skip LLM entirely (credit saver)
-    const fileList = matchedFiles.map((f: any) => f.name).join(', ')
-    responseText = `I found ${matchedFiles.length} file(s) matching your query: ${fileList}. Here are the results:`
-  } else {
-    // Ambiguous or many matches — use LLM with file context (but only with cached results, not a fresh search)
-    const fileContext = formatFileContext(matchedFiles.slice(0, 15))
-    responseText = await callGemini(message, fileContext)
+async function processQuery(message: string, userId = '', channel = 'web'): Promise<ProcessResult> {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+    throw new Error('Knowledge base not configured: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing.')
   }
 
-  // Step 6: Log to Supabase (non-blocking)
-  if (SUPABASE_URL && SUPABASE_SERVICE_ROLE) {
-    try {
-      await fetch(`${SUPABASE_URL}/rest/v1/chat_logs`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          apikey: SUPABASE_SERVICE_ROLE,
-          Authorization: `Bearer ${SUPABASE_SERVICE_ROLE}`,
-        },
-        body: JSON.stringify({
-          query: message,
-          matched_count: matchedFiles.length,
-          confident: confident,
-          used_llm: !confident && matchedFiles.length > 0,
-        }),
-      })
-    } catch (e) {
-      console.error('[Supabase] Failed to log query:', e)
+  // Step 1: Embed the question, then search text knowledge, media and the Drive index in parallel
+  const embedding = await embedQuery(message)
+  const [knowledge, media, driveHits] = await Promise.all([
+    matchKb(message, embedding, ['fact', 'qa', 'project', 'expert_answer', 'document'], 10),
+    matchKb(message, embedding, ['media'], 16),
+    searchDrive(message),
+  ])
+
+  // Documents the knowledge came from are offered as Drive files too, so they can be attached
+  const drive: DriveHit[] = [...driveHits]
+  for (const k of knowledge) {
+    const d = k.meta?.drive
+    if (k.kind === 'document' && d?.id && !drive.some((f) => f.id === d.id)) {
+      drive.push({ id: d.id, name: d.name, mime_type: d.mime_type, kind: 'document', path: d.path ?? null,
+        web_view_link: d.web_view_link ?? null, size: null, duration_ms: null, score: 0 })
     }
   }
+
+  // Step 2: Let Gemini answer from that context and pick matching media and files
+  const knowledgeText = knowledge.map((k) =>
+    k.kind === 'document'
+      ? `- From document "${k.meta?.drive?.name ?? k.title}": ${k.body}`
+      : `- ${k.title ? k.title + ': ' : ''}${k.body}`
+  ).join('\n')
+  const mediaText = media.map(mediaLine).join('\n')
+  const driveText = drive.map((f, i) => driveLine(f, i + 1)).join('\n')
+  const llm = await callGemini(message, knowledgeText, mediaText, driveText)
+
+  let responseText: string
+  let answered: boolean
+  let picked: KbItem[]
+  let pickedDrive: DriveHit[]
+
+  if (llm) {
+    responseText = llm.answer
+    answered = llm.answered
+    const byId = new Map(media.map((m) => [m.id, m]))
+    picked = (llm.media_ids ?? []).map((id) => byId.get(id)).filter(Boolean) as KbItem[]
+    pickedDrive = [...new Set(llm.drive_ids ?? [])].map((i) => drive[i - 1]).filter(Boolean)
+  } else {
+    // Gemini unavailable: fall back to the top search hits without a written answer
+    picked = media.slice(0, 6)
+    pickedDrive = driveHits.slice(0, 6)
+    answered = knowledge.length > 0 || picked.length > 0 || pickedDrive.length > 0
+    responseText = knowledge.length > 0
+      ? `Here is what I found:\n${knowledge.slice(0, 3).map((k) => `• ${k.title ?? k.body.slice(0, 160)}`).join('\n')}`
+      : picked.length > 0 || pickedDrive.length > 0
+        ? 'Here are the closest files I found:'
+        : `I couldn't find anything on "${message}" yet. I've passed the question to the product team.`
+  }
+
+  if (!answered && picked.length === 0 && pickedDrive.length === 0) {
+    await savePendingQuestion(message, userId, channel)
+  }
+
+  // Step 3: Signed URLs for the chosen photos/videos (private bucket)
+  const urls = await signMedia(picked.map((m) => m.media_path!).filter(Boolean))
+  const withUrl = picked.filter((m) => m.media_path && urls[m.media_path])
+
+  const mediaResults: any[] = withUrl.filter((m) => m.media_type !== 'video').map((m) => ({
+    name: m.title ?? m.media_path,
+    url: urls[m.media_path!],
+    thumbnail: urls[m.media_path!],
+  }))
+
+  const videoResults: any[] = withUrl.filter((m) => m.media_type === 'video').map((m) => ({
+    name: m.title ?? m.media_path,
+    mime_type: 'video/mp4',
+    url: urls[m.media_path!],
+    thumbnail: null,
+  }))
+
+  // Step 4: Drive files Gemini picked. Previews go through the get-image proxy so they work
+  // without a Google login; originals can be huge (25MB PNGs, 1GB videos), so photos use a
+  // large thumbnail and the "Open in Drive" link leads to the full-resolution file.
+  for (const f of pickedDrive) {
+    if (f.kind === 'image') {
+      mediaResults.push({ name: f.name, url: proxyUrl(f.id, '&thumb=1600'), thumbnail: proxyUrl(f.id, '&thumb=600'), web_view_link: driveViewUrl(f) })
+    }
+  }
+  for (const f of pickedDrive) {
+    if (f.kind === 'video') {
+      videoResults.push({ name: f.name, mime_type: f.mime_type, url: proxyUrl(f.id), thumbnail: proxyUrl(f.id, '&thumb=800'), web_view_link: driveViewUrl(f) })
+    }
+  }
+  const docResults = pickedDrive.filter((f) => f.kind === 'document' || f.kind === 'folder').map((f) => ({
+    name: f.kind === 'folder' ? `Folder: ${f.path ? f.path + '/' : ''}${f.name}` : f.name,
+    mime_type: f.mime_type,
+    type: f.kind === 'folder' ? 'folder' : undefined,
+    url: f.kind === 'folder' ? driveViewUrl(f) : proxyUrl(f.id),
+    web_view_link: driveViewUrl(f),
+  }))
+
+  await logQuery(message, knowledge.length + media.length + docResults.length, answered, Boolean(llm))
 
   return {
     response: responseText,
@@ -225,7 +483,7 @@ function formatWhatsAppResponse(result: ProcessResult): string {
   if (result.documents.length > 0) {
     text += '\n*Documents:*\n'
     result.documents.forEach((d, i) => {
-      text += `${i + 1}. ${d.name}\n${d.web_view_link}\n`
+      text += `${i + 1}. ${d.name}\n${d.url}\n`
     })
   }
 
@@ -314,7 +572,7 @@ Deno.serve(async (req: Request) => {
     }
 
     // Process the query
-    const result = await processQuery(message, userId)
+    const result = await processQuery(message, userId, isWhatsApp ? 'whatsapp' : 'web')
 
     // ── Return response ──
     if (isWhatsApp) {

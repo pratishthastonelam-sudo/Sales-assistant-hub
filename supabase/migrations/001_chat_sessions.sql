@@ -45,24 +45,28 @@ ALTER TABLE public.chat_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.chat_logs    ENABLE ROW LEVEL SECURITY;
 
 -- Policy: users can read their own sessions
+DROP POLICY IF EXISTS "Users can read own chat sessions" ON public.chat_sessions;
 CREATE POLICY "Users can read own chat sessions"
     ON public.chat_sessions
     FOR SELECT
     USING (auth.uid() = user_id);
 
 -- Policy: users can insert their own sessions
+DROP POLICY IF EXISTS "Users can insert own chat sessions" ON public.chat_sessions;
 CREATE POLICY "Users can insert own chat sessions"
     ON public.chat_sessions
     FOR INSERT
     WITH CHECK (auth.uid() = user_id);
 
 -- Policy: users can update their own sessions
+DROP POLICY IF EXISTS "Users can update own chat sessions" ON public.chat_sessions;
 CREATE POLICY "Users can update own chat sessions"
     ON public.chat_sessions
     FOR UPDATE
     USING (auth.uid() = user_id);
 
 -- Policy: users can delete their own sessions
+DROP POLICY IF EXISTS "Users can delete own chat sessions" ON public.chat_sessions;
 CREATE POLICY "Users can delete own chat sessions"
     ON public.chat_sessions
     FOR DELETE
@@ -70,6 +74,7 @@ CREATE POLICY "Users can delete own chat sessions"
 
 -- Policy: chat_logs are insert-only via service role (Edge Function)
 -- No direct user access — logs are internal analytics.
+DROP POLICY IF EXISTS "Service role can manage chat_logs" ON public.chat_logs;
 CREATE POLICY "Service role can manage chat_logs"
     ON public.chat_logs
     FOR ALL
@@ -86,7 +91,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER IF NOT EXISTS trg_chat_sessions_updated_at
+DROP TRIGGER IF EXISTS trg_chat_sessions_updated_at ON public.chat_sessions;
+CREATE TRIGGER trg_chat_sessions_updated_at
     BEFORE UPDATE ON public.chat_sessions
     FOR EACH ROW
     EXECUTE FUNCTION public.handle_updated_at();

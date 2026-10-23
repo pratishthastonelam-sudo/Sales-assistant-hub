@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useAuth } from '../context/AuthContext.jsx'
+import { friendlyAuthError } from '../lib/supabase.js'
 
 export default function LoginScreen() {
   const { signIn, signUp, resetPasswordForEmail, resendConfirmationEmail } = useAuth()
@@ -25,7 +26,7 @@ export default function LoginScreen() {
       const { error: resetError } = await resetPasswordForEmail(email)
       setBusy(false)
       if (resetError) {
-        setError(resetError.message)
+        setError(friendlyAuthError(resetError.message))
       } else {
         setInfo('Check your email for a password reset link.')
       }
@@ -45,7 +46,7 @@ export default function LoginScreen() {
       if (authError.message?.toLowerCase().includes('email not confirmed')) {
         setError('Your email is not confirmed yet.')
       } else {
-        setError(authError.message)
+        setError(friendlyAuthError(authError.message))
       }
     } else if (mode === 'signup') {
       setInfo('Account created! Check your email to confirm before signing in.')
@@ -62,7 +63,7 @@ export default function LoginScreen() {
     const { error: resendError } = await resendConfirmationEmail(email)
     setBusy(false)
     if (resendError) {
-      setError(resendError.message)
+      setError(friendlyAuthError(resendError.message))
     } else {
       setInfo('Confirmation email resent. Check your inbox.')
     }
