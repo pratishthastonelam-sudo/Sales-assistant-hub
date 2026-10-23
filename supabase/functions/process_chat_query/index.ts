@@ -146,6 +146,38 @@ async function searchDrive(message: string): Promise<DriveHit[]> {
   }
 }
 
+// A picked folder is only a link; pull the photos inside it (and its subfolders) so they show on screen.
+async function folderImages(folders: DriveHit[], limit: number): Promise<DriveHit[]> {
+  const out: DriveHit[] = []
+  const picked = folders.slice(0, 4)
+  // Spread across folders so "different projects" shows several sites, not one
+  const perFolder = Math.ceil(limit / Math.max(picked.length, 1))
+  for (const f of picked) {
+    if (out.length >= limit) break
+    const full = f.path ? `${f.path}/${f.name}` : f.name
+    const q = new URLSearchParams({
+      select: 'id,name,mime_type,kind,path,web_view_link,size,duration_ms',
+      kind: 'eq.image',
+      or: `(parent_id.eq.${f.id},path.like."${full.replace(/"/g, '')}/*")`,
+      order: 'name',
+      limit: String(Math.min(perFolder * 2, limit - out.length)),
+    })
+    try {
+      const resp = await fetch(`${SUPABASE_URL}/rest/v1/drive_files?${q}`, {
+        headers: DB_HEADERS,
+        signal: AbortSignal.timeout(5 * 1000),
+      })
+      if (!resp.ok) throw new Error(`drive_files ${resp.status}: ${await resp.text()}`)
+      const rows: DriveHit[] = await resp.json()
+      const fresh = rows.filter((r) => !out.some((o) => o.id === r.id)).slice(0, perFolder)
+      for (const r of fresh) out.push({ ...r, score: 0 })
+    } catch (e) {
+      console.error('[Drive] Folder expand skipped:', (e as Error).message)
+    }
+  }
+  return out
+}
+
 function driveLine(f: DriveHit, i: number): string {
   const where = f.path ? `${f.path}/` : ''
   const extra = f.kind === 'video' && f.duration_ms ? ` (${Math.round(f.duration_ms / 1000)}s)` : ''
@@ -440,6 +472,11 @@ async function processQuery(message: string, userId = '', channel = 'web'): Prom
   // Step 4: Drive files Gemini picked. Previews go through the get-image proxy so they work
   // without a Google login; originals can be huge (25MB PNGs, 1GB videos), so photos use a
   // large thumbnail and the "Open in Drive" link leads to the full-resolution file.
+  const pickedImages = pickedDrive.filter((f) => f.kind === 'image')
+  if (pickedImages.length + mediaResults.length < 8) {
+    const extra = await folderImages(pickedDrive.filter((f) => f.kind === 'folder'), 12 - pickedImages.length)
+    pickedDrive.push(...extra.filter((x) => !pickedImages.some((p) => p.id === x.id)))
+  }
   for (const f of pickedDrive) {
     if (f.kind === 'image') {
       mediaResults.push({ name: f.name, url: proxyUrl(f.id, '&thumb=1600'), thumbnail: proxyUrl(f.id, '&thumb=600'), web_view_link: driveViewUrl(f) })
@@ -451,7 +488,7 @@ async function processQuery(message: string, userId = '', channel = 'web'): Prom
     }
   }
   const docResults = pickedDrive.filter((f) => f.kind === 'document' || f.kind === 'folder').map((f) => ({
-    name: f.kind === 'folder' ? `Folder: ${f.path ? f.path + '/' : ''}${f.name}` : f.name,
+    name: f.kind === 'folder' ? `Folder: ${f.name}` : f.name,
     mime_type: f.mime_type,
     type: f.kind === 'folder' ? 'folder' : undefined,
     url: f.kind === 'folder' ? driveViewUrl(f) : proxyUrl(f.id),
