@@ -11,12 +11,16 @@
  *  - GET              → Meta webhook verification (hub.challenge)
  *  - POST (from Meta) → signed with the app secret (X-Hub-Signature-256);
  *                       we answer 200 at once and work in the background
+ *  - POST ?action=notify (X-Notify-Secret) → from the kb_pending_questions trigger
+ *                       (006_pending_alerts.sql): a question the bot couldn't answer,
+ *                       on the web app or WhatsApp, goes to experts/admins on WhatsApp
+ *                       and by email (Resend) to ALERT_EMAIL_TO
  *  - POST ?action=setup|status (service-role key) → one-off setup: subscribe
  *                       the webhook, register the number, create templates
  *
  *  Who may talk to the bot is the wa_contacts table (005_whatsapp.sql):
  *    sales  — asks questions, gets text + photos, videos and documents back
- *    expert — also receives questions the bot can't answer; a swipe-reply
+ *    expert — also receives questions the bot can't answer (web or WhatsApp); a swipe-reply
  *             (or "#12 answer") saves the answer to the knowledge base and
  *             sends it to whoever asked
  *    admin  — also manages the list from WhatsApp: "add 98… Name", "team"…
@@ -25,7 +29,8 @@
  *  so expert pings and late answers fall back to the templates below.
  *
  *  Secrets: WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_APP_SECRET,
- *  WHATSAPP_VERIFY_TOKEN; optional WHATSAPP_PIN (number registration),
+ *  WHATSAPP_VERIFY_TOKEN, PENDING_NOTIFY_SECRET; RESEND_API_KEY + ALERT_EMAIL_TO
+ *  (optional ALERT_EMAIL_FROM) for email alerts; optional WHATSAPP_PIN (number registration),
  *  WHATSAPP_GRAPH_URL (tests only). GEMINI_API_KEY for voice notes and
  *  embedding expert answers.
  * ═══════════════════════════════════════════════════════════════
@@ -58,6 +63,10 @@ const MAX_DOCS = 4
 const WINDOW_MS = 23.5 * 60 * 60 * 1000 // a little under WhatsApp's 24h, for clock drift
 const DEFAULT_COUNTRY = '91'
 const WEB_APP_URL = env('WEB_APP_URL', 'https://sales-assistant-hub-1svt.vercel.app')
+const NOTIFY_SECRET = env('PENDING_NOTIFY_SECRET')
+const RESEND_API_KEY = env('RESEND_API_KEY')
+const ALERT_EMAILS = env('ALERT_EMAIL_TO').split(',').map((e) => e.trim()).filter(Boolean)
+const ALERT_EMAIL_FROM = env('ALERT_EMAIL_FROM', 'Stonelam Sales Bot <onboarding@resend.dev>')
 
 // Templates for messages outside the 24h window (created by ?action=setup, approved by Meta)
 const TEMPLATES = {
@@ -286,8 +295,7 @@ async function askBot(question: string, phone: string): Promise<any> {
 
 const GOOGLE_NATIVE = /^application\/vnd\.google-apps\./
 
-async function answerQuestion(question: string, phone: string, contact: Contact) {
-  const startedAt = new Date(Date.now() - 5000).toISOString()
+async function answerQuestion(question: string, phone: string) {
   let result: any
   try {
     result = await askBot(question, phone)
@@ -326,13 +334,8 @@ async function answerQuestion(question: string, phone: string, contact: Contact)
     await sendMedia(phone, { type: 'document', document: { link: d.url, filename: d.name } }, `📄 ${d.name}\n${link}`, d.name)
   }
   if (links.length) await sendText(phone, links.join('\n\n'))
-
-  // process_chat_query saves questions it couldn't answer; pass those to the experts
-  const pending = await db(
-    `kb_pending_questions?asked_by=eq.${phone}&status=eq.open&created_at=gte.${encodeURIComponent(startedAt)}` +
-      `&question=eq.${encodeURIComponent(question)}&order=id.desc&limit=1`, {}, '',
-  )
-  if (pending?.[0]) await forwardToExperts(pending[0].id, question, phone, contact)
+  // A question it couldn't answer was saved to kb_pending_questions; the database trigger
+  // (006_pending_alerts.sql) calls ?action=notify for it, for web and WhatsApp alike.
 }
 
 async function sendMedia(to: string, payload: Record<string, unknown>, fallback: string, name: string) {
@@ -347,35 +350,93 @@ async function sendMedia(to: string, payload: Record<string, unknown>, fallback:
 
 // ── Expert loop ──────────────────────────────────────────
 
-async function forwardToExperts(pendingId: number, question: string, askerPhone: string, asker: Contact | null) {
-  const experts: Contact[] = await db('wa_contacts?role=eq.expert&active=eq.true&select=*', {}, '')
-  await db(`kb_pending_questions?id=eq.${pendingId}`, {
-    method: 'PATCH',
-    body: JSON.stringify({
-      channel: 'whatsapp',
-      status: experts.length ? 'forwarded' : 'open',
-      expert: experts.map((e) => e.phone).join(',') || null,
-    }),
-  }, 'return=minimal')
+// Who asked: a WhatsApp number, or a web user (auth id → their email)
+async function askerLabel(askedBy: string | null): Promise<{ label: string; phone: string | null; channel: string }> {
+  if (askedBy && /^[0-9]{11,15}$/.test(askedBy)) {
+    return { label: displayName(await getContact(askedBy), askedBy), phone: askedBy, channel: 'WhatsApp' }
+  }
+  if (askedBy && /^[0-9a-f-]{36}$/i.test(askedBy)) {
+    try {
+      const resp = await fetch(`${SUPABASE_URL}/auth/v1/admin/users/${askedBy}`, { headers: DB_HEADERS, signal: AbortSignal.timeout(5000) })
+      if (resp.ok) {
+        const u = await resp.json()
+        return { label: u.user_metadata?.full_name || u.email || 'a web user', phone: null, channel: 'web app' }
+      }
+    } catch (e) {
+      console.error('[Notify] user lookup failed:', (e as Error).message)
+    }
+  }
+  return { label: askedBy && !/^[0-9a-f-]{36}$/i.test(askedBy) ? askedBy : 'a web app user', phone: null, channel: 'web app' }
+}
 
-  const who = displayName(asker, askerPhone)
+const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!))
+
+async function sendEmail(subject: string, html: string): Promise<boolean> {
+  if (!RESEND_API_KEY || ALERT_EMAILS.length === 0) return false
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: ALERT_EMAIL_FROM, to: ALERT_EMAILS, subject, html }),
+      signal: AbortSignal.timeout(10 * 1000),
+    })
+    if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`)
+    return true
+  } catch (e) {
+    console.error('[Notify] email failed:', (e as Error).message)
+    return false
+  }
+}
+
+// A new unanswered question (web or WhatsApp): WhatsApp the experts and email the alert list
+async function notifyPending(pendingId: number) {
+  const q = (await db(`kb_pending_questions?id=eq.${pendingId}&select=*`, {}, ''))?.[0]
+  if (!q || q.status !== 'open') return { skipped: true }
+  const asker = await askerLabel(q.asked_by)
+
+  const experts: Contact[] = WA_TOKEN && WA_PHONE_ID
+    ? await db('wa_contacts?role=in.(expert,admin)&active=eq.true&select=*', {}, '')
+    : []
+  const reached: string[] = []
   for (const ex of experts) {
-    if (ex.phone === askerPhone) continue
+    if (ex.phone === asker.phone) continue
     try {
       if (inWindow(ex)) {
         await sendText(ex.phone,
-          `❓ *Question #${pendingId}* from ${who}:\n\n"${question}"\n\n` +
+          `❓ *Question #${pendingId}* from ${asker.label} (${asker.channel}):\n\n"${q.question}"\n\n` +
             `Swipe-reply to this message with the answer and I'll save it for the whole team. ` +
             `Or send *#${pendingId} your answer*, or *skip ${pendingId}* if it shouldn't be answered.`,
           { pendingId })
       } else {
         await sendTemplate(ex.phone, TEMPLATES.question.name,
-          [param(who, 60), param(question, 400), param(`#${pendingId}`, 12)], { pendingId })
+          [param(asker.label, 60), param(q.question, 400), param(`#${pendingId}`, 12)], { pendingId })
       }
+      reached.push(ex.phone)
     } catch (e) {
       console.error(`[WA] forward to ${ex.phone} failed:`, (e as Error).message)
     }
   }
+
+  const how = reached.length
+    ? `To answer, swipe-reply to the WhatsApp alert, or send <b>#${pendingId} your answer</b> to the sales bot on WhatsApp. ` +
+      `The answer is saved to the knowledge base${asker.phone ? ` and sent to ${esc(asker.label)}` : ''}.`
+    : `WhatsApp alerts aren't set up yet, so for now the question is stored in the knowledge base's pending list (#${pendingId}).`
+  const emailed = await sendEmail(`Sales bot couldn't answer: ${q.question.slice(0, 80)}`,
+    `<p>The sales assistant couldn't answer this question:</p>` +
+      `<blockquote style="font-size:16px;border-left:3px solid #999;margin:0;padding:4px 12px">${esc(q.question)}</blockquote>` +
+      `<p><b>Asked by:</b> ${esc(asker.label)}<br><b>Channel:</b> ${asker.channel}<br>` +
+      `<b>When:</b> ${new Date(q.created_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST<br><b>Ref:</b> #${pendingId}</p>` +
+      `<p>${how}</p>`)
+
+  await db(`kb_pending_questions?id=eq.${pendingId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      channel: asker.phone ? 'whatsapp' : 'web',
+      status: reached.length || emailed ? 'forwarded' : 'open',
+      expert: [...reached, ...(emailed ? ALERT_EMAILS : [])].join(',') || null,
+    }),
+  }, 'return=minimal')
+  return { whatsapp: reached, emailed }
 }
 
 async function saveExpertAnswer(pendingId: number, answer: string, expertPhone: string, expert: Contact) {
@@ -577,7 +638,7 @@ async function handleMessage(msg: any, profileName: string | undefined) {
     return
   }
 
-  await answerQuestion(text, phone, contact)
+  await answerQuestion(text, phone)
 }
 
 // Delivery receipts. A media message WhatsApp couldn't fetch is replaced by its link.
@@ -724,6 +785,16 @@ Deno.serve(async (req: Request) => {
   if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 })
 
   const action = url.searchParams.get('action')
+  // Database trigger on kb_pending_questions (006_pending_alerts.sql)
+  if (action === 'notify') {
+    if (!NOTIFY_SECRET || req.headers.get('X-Notify-Secret') !== NOTIFY_SECRET) return new Response('Forbidden', { status: 403 })
+    const { id } = await req.json().catch(() => ({}))
+    if (!id) return json({ error: 'id required' }, 400)
+    const work = notifyPending(Number(id)).catch((e) => console.error('[Notify] failed:', e))
+    if (typeof EdgeRuntime !== 'undefined') EdgeRuntime.waitUntil(work)
+    else await work
+    return json({ ok: true })
+  }
   if (action) {
     if (req.headers.get('Authorization') !== `Bearer ${SUPABASE_SERVICE_ROLE}`) return new Response('Forbidden', { status: 403 })
     if (action === 'setup' || action === 'status') return json(await setup(action === 'setup'))

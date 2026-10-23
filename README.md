@@ -231,7 +231,8 @@ When voice input is used, the AI response is automatically spoken aloud. A "Stop
   (`add 98123 45678 Name`, `add expert …`, `remove …`, `team`).
 - Replies come back as text plus real WhatsApp photos, videos and documents; a file WhatsApp can't fetch is
   replaced by its link. Voice notes (English/Hindi/Hinglish) are transcribed with Gemini.
-- Unanswered questions go to every expert. A swipe-reply (or `#12 answer`) saves the answer to `kb_items`
+- Unanswered questions, from the web app or WhatsApp, go to every expert and admin on WhatsApp and by email
+  (trigger in `006_pending_alerts.sql`, Resend for email: `RESEND_API_KEY`, `ALERT_EMAIL_TO`). A swipe-reply (or `#12 answer`) saves the answer to `kb_items`
   as `expert_answer` and sends it to whoever asked. Outside WhatsApp's 24-hour window the approved templates
   `sales_bot_expert_question` / `sales_bot_expert_answer` are used.
 - Secrets: `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN`
