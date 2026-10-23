@@ -33,7 +33,7 @@ export default function LoginScreen() {
       return
     }
 
-    const { error: authError } =
+    const { data, error: authError } =
       mode === 'signin'
         ? await signIn(email, password)
         : await signUp(email, password)
@@ -48,7 +48,7 @@ export default function LoginScreen() {
       } else {
         setError(friendlyAuthError(authError.message))
       }
-    } else if (mode === 'signup') {
+    } else if (mode === 'signup' && !data?.session) {
       setInfo('Account created! Check your email to confirm before signing in.')
     }
   }

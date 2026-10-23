@@ -39,6 +39,9 @@ export function friendlyAuthError(message = '') {
   if (m.includes('failed to fetch') || m.includes('networkerror') || m.includes('load failed')) {
     return 'Cannot reach the login server. The Supabase project may be paused or its URL changed. Please contact the admin.'
   }
+  if (m.includes('database error saving new user') || m.includes('company email')) {
+    return 'Please sign up with your company email address.'
+  }
   if (m.includes('invalid api key') || m.includes('no api key')) {
     return 'The app\'s Supabase API key is invalid or was rotated. Please contact the admin.'
   }
