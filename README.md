@@ -221,6 +221,35 @@ This prevents wasting LLM API credits on queries that can be answered from the f
 
 When voice input is used, the AI response is automatically spoken aloud. A "Stop" button appears while speaking. Browser support: Chrome/Edge (full), Safari (partial), Firefox (synthesis only).
 
+## Unanswered Questions
+
+When the assistant can't answer, the question lands in `kb_pending_questions`. A trigger
+(`006_pending_alerts.sql`) calls the `pending_questions` function, which emails `ALERT_EMAIL_TO` through Resend
+with a link to the **Unanswered questions** page in the web app. That page is shown only to `ADMIN_EMAILS`; an
+answer saved there goes into `kb_items` as an `expert_answer`, so the assistant answers it itself next time.
+
+Secrets: `RESEND_API_KEY`, `ALERT_EMAIL_TO`, `ADMIN_EMAILS`, `PENDING_NOTIFY_SECRET` (also stored in Vault as
+`pending_notify_secret`, with `project_url`).
+
+## WhatsApp Bot (on hold)
+
+`supabase/functions/whatsapp_webhook` connects the assistant to the WhatsApp Cloud API. It is separate from
+`process_chat_query` and gets its answers from it over HTTP, so the web app is not affected.
+
+- Only numbers in `wa_contacts` (migration `005_whatsapp.sql`) can use it: `sales` ask questions, `expert`
+  also answer the questions the bot can't, `admin` also manage the list from WhatsApp
+  (`add 98123 45678 Name`, `add expert …`, `remove …`, `team`).
+- Replies come back as text plus real WhatsApp photos, videos and documents; a file WhatsApp can't fetch is
+  replaced by its link. Voice notes (English/Hindi/Hinglish) are transcribed with Gemini.
+- Unanswered questions, from the web app or WhatsApp, go to every expert and admin on WhatsApp and by email
+  (trigger in `006_pending_alerts.sql`, Resend for email: `RESEND_API_KEY`, `ALERT_EMAIL_TO`). A swipe-reply (or `#12 answer`) saves the answer to `kb_items`
+  as `expert_answer` and sends it to whoever asked. Outside WhatsApp's 24-hour window the approved templates
+  `sales_bot_expert_question` / `sales_bot_expert_answer` are used.
+- Secrets: `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN`
+  (optional `WHATSAPP_PIN` to register the number). Then
+  `POST /functions/v1/whatsapp_webhook?action=setup` with the service-role key subscribes the webhook,
+  registers the number and submits the templates; `?action=status` reports the current state.
+
 ## Build for Production
 
 ```bash

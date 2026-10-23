@@ -7,6 +7,9 @@ export default function Sidebar({
   onSelectSession,
   userEmail,
   onSignOut,
+  pendingCount,
+  pendingActive,
+  onShowPending,
 }) {
   return (
     <>
@@ -55,6 +58,28 @@ export default function Sidebar({
             New Chat
           </button>
         </div>
+
+        {/* Unanswered questions (admins only: pendingCount is null for everyone else) */}
+        {pendingCount !== null && (
+          <div className="mt-2 px-3">
+            <button
+              onClick={onShowPending}
+              className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm font-medium transition ${
+                pendingActive ? 'bg-brand-50 text-brand-700' : 'text-gray-700 hover:bg-gray-50'
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <svg className="h-4 w-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                Unanswered questions
+              </span>
+              {pendingCount > 0 && (
+                <span className="rounded-full bg-red-500 px-2 py-0.5 text-xs font-semibold text-white">{pendingCount}</span>
+              )}
+            </button>
+          </div>
+        )}
 
         {/* History list */}
         <div className="mt-4 flex-1 overflow-y-auto px-2 scrollbar-thin">
