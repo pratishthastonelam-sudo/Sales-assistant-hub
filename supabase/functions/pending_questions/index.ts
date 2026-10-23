@@ -90,6 +90,7 @@ const askerLabel = (askedBy: string | null, emails: Record<string, string>) =>
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!))
 
 let lastEmailError = ''
+let lastEmailId = ''
 
 async function sendEmail(subject: string, html: string): Promise<boolean> {
   if (!RESEND_API_KEY || ALERT_EMAILS.length === 0) {
@@ -105,6 +106,7 @@ async function sendEmail(subject: string, html: string): Promise<boolean> {
       signal: AbortSignal.timeout(10 * 1000),
     })
     if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`)
+    lastEmailId = (await resp.json())?.id ?? ''
     return true
   } catch (e) {
     lastEmailError = (e as Error).message
@@ -135,7 +137,7 @@ async function notify(id: number) {
       body: JSON.stringify({ status: 'forwarded', expert: ALERT_EMAILS.join(',') }),
     }, 'return=minimal')
   }
-  return { emailed, error: emailed ? undefined : lastEmailError }
+  return { emailed, email_id: lastEmailId || undefined, error: emailed ? undefined : lastEmailError }
 }
 
 // ── Saving an answer ─────────────────────────────────────
@@ -213,6 +215,15 @@ Deno.serve(async (req: Request) => {
   const url = new URL(req.url)
 
   try {
+    // Delivery status of an alert email (delivered, bounced…), for checking the email setup
+    if (url.searchParams.get('action') === 'email_status') {
+      if (!NOTIFY_SECRET || req.headers.get('X-Notify-Secret') !== NOTIFY_SECRET) return json({ error: 'forbidden' }, 403)
+      const resp = await fetch(`https://api.resend.com/emails/${encodeURIComponent(url.searchParams.get('id') ?? '')}`, {
+        headers: { Authorization: `Bearer ${RESEND_API_KEY}` },
+      })
+      const e = await resp.json()
+      return json({ status: resp.status, to: e.to, from: e.from, last_event: e.last_event, created_at: e.created_at, error: e.message })
+    }
     if (url.searchParams.get('action') === 'notify') {
       if (!NOTIFY_SECRET || req.headers.get('X-Notify-Secret') !== NOTIFY_SECRET) return json({ error: 'forbidden' }, 403)
       const { id } = await req.json().catch(() => ({}))
