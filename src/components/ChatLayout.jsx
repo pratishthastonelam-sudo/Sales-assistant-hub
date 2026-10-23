@@ -1,22 +1,52 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { useAuth } from '../context/AuthContext.jsx'
 import Sidebar from './Sidebar.jsx'
 import ChatWindow from './ChatWindow.jsx'
-import { supabase } from '../lib/supabase.js'
+import PendingQuestions from './PendingQuestions.jsx'
+import { supabase, PENDING_FUNCTION_URL } from '../lib/supabase.js'
 
 export default function ChatLayout() {
   const { user, signOut } = useAuth()
   const [sessions, setSessions] = useState([])
   const [activeSessionId, setActiveSessionId] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  // 'pending' shows unanswered questions; the alert email links to ?view=pending
+  const [view, setView] = useState(() => new URLSearchParams(window.location.search).get('view') === 'pending' ? 'pending' : 'chat')
+  // null until we know; the list only loads for admins (the function returns 403 for everyone else)
+  const [pending, setPending] = useState(null)
+
+  const loadPending = useCallback(async () => {
+    try {
+      const { data } = await supabase.auth.getSession()
+      const resp = await fetch(PENDING_FUNCTION_URL, { headers: { Authorization: `Bearer ${data.session?.access_token}` } })
+      setPending(resp.ok ? (await resp.json()).questions : false)
+    } catch {
+      setPending(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadPending()
+  }, [loadPending])
+
+  const showView = useCallback((v) => {
+    setView(v)
+    const url = new URL(window.location.href)
+    if (v === 'pending') url.searchParams.set('view', 'pending')
+    else url.searchParams.delete('view')
+    window.history.replaceState(null, '', url)
+    if (v === 'pending') loadPending()
+  }, [loadPending])
 
   const handleNewSession = useCallback(() => {
     setActiveSessionId(null)
-  }, [])
+    showView('chat')
+  }, [showView])
 
   const handleSelectSession = useCallback((id) => {
     setActiveSessionId(id)
-  }, [])
+    showView('chat')
+  }, [showView])
 
   const handleSessionCreated = useCallback((id) => {
     if (id && !sessions.find((s) => s.id === id)) {
@@ -39,6 +69,9 @@ export default function ChatLayout() {
         onSelectSession={handleSelectSession}
         userEmail={user?.email}
         onSignOut={signOut}
+        pendingCount={pending ? pending.filter((q) => q.status === 'open' || q.status === 'forwarded').length : null}
+        pendingActive={view === 'pending'}
+        onShowPending={() => showView('pending')}
       />
 
       {/* Main chat area */}
@@ -56,7 +89,7 @@ export default function ChatLayout() {
             </button>
             <div>
               <h2 className="text-sm font-semibold text-gray-900">
-                {activeSessionId ? 'Chat Session' : 'New Chat'}
+                {view === 'pending' ? 'Unanswered questions' : activeSessionId ? 'Chat Session' : 'New Chat'}
               </h2>
               <p className="text-xs text-gray-400">Sales Assistant Hub</p>
             </div>
@@ -71,13 +104,16 @@ export default function ChatLayout() {
           </div>
         </header>
 
-        {/* Chat window */}
-        <ChatWindow
-          sessionId={activeSessionId}
-          onSessionCreated={handleSessionCreated}
-          sessions={sessions}
-          setSessions={setSessions}
-        />
+        {view === 'pending' && pending ? (
+          <PendingQuestions questions={pending} onReload={loadPending} />
+        ) : (
+          <ChatWindow
+            sessionId={activeSessionId}
+            onSessionCreated={handleSessionCreated}
+            sessions={sessions}
+            setSessions={setSessions}
+          />
+        )}
       </div>
     </div>
   )

@@ -30,6 +30,9 @@ export const EDGE_FUNCTION_URL =
   import.meta.env.VITE_EDGE_FUNCTION_URL ||
   `${supabaseUrl}/functions/v1/process_chat_query`
 
+// Unanswered questions (admins only)
+export const PENDING_FUNCTION_URL = `${supabaseUrl}/functions/v1/pending_questions`
+
 // Turns low-level network failures into a message the sales team can act on
 export function friendlyAuthError(message = '') {
   if (!supabaseConfigured) {

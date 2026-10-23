@@ -1,8 +1,8 @@
 -- ═══════════════════════════════════════════════════════════════
 --  Sales Assistant Hub — alert on unanswered questions
 --  Every new row in kb_pending_questions (web app or WhatsApp) calls
---  whatsapp_webhook?action=notify, which WhatsApps the experts/admins
---  and emails ALERT_EMAIL_TO.
+--  pending_questions?action=notify, which emails ALERT_EMAIL_TO
+--  (and, once the WhatsApp bot is live, can alert experts there too).
 --  Needs two Vault secrets (set once, not stored in this file):
 --    select vault.create_secret('https://<ref>.supabase.co', 'project_url');
 --    select vault.create_secret('<same as PENDING_NOTIFY_SECRET>', 'pending_notify_secret');
@@ -27,7 +27,7 @@ BEGIN
     END IF;
     -- pg_net is asynchronous: the insert never waits on, or fails because of, the alert
     PERFORM net.http_post(
-        url     := base || '/functions/v1/whatsapp_webhook?action=notify',
+        url     := base || '/functions/v1/pending_questions?action=notify',
         body    := jsonb_build_object('id', NEW.id),
         headers := jsonb_build_object('Content-Type', 'application/json', 'X-Notify-Secret', secret)
     );
