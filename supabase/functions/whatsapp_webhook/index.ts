@@ -66,7 +66,8 @@ const WEB_APP_URL = env('WEB_APP_URL', 'https://sales-assistant-hub-1svt.vercel.
 const NOTIFY_SECRET = env('PENDING_NOTIFY_SECRET')
 const RESEND_API_KEY = env('RESEND_API_KEY')
 const ALERT_EMAILS = env('ALERT_EMAIL_TO').split(',').map((e) => e.trim()).filter(Boolean)
-const ALERT_EMAIL_FROM = env('ALERT_EMAIL_FROM', 'Stonelam Sales Bot <onboarding@resend.dev>')
+// Not through env(): its <> trimming would break the "Name <address>" form
+const ALERT_EMAIL_FROM = (Deno.env.get('ALERT_EMAIL_FROM') ?? '').trim() || 'Stonelam Sales Bot <onboarding@resend.dev>'
 
 // Templates for messages outside the 24h window (created by ?action=setup, approved by Meta)
 const TEMPLATES = {

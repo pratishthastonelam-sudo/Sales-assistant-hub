@@ -32,7 +32,8 @@ const NOTIFY_SECRET = env('PENDING_NOTIFY_SECRET')
 const RESEND_API_KEY = env('RESEND_API_KEY')
 const ALERT_EMAILS = list('ALERT_EMAIL_TO', 'pratishtha.gupta@stonelam.com')
 const ADMIN_EMAILS = list('ADMIN_EMAILS', 'pratishtha.gupta@stonelam.com')
-const ALERT_EMAIL_FROM = env('ALERT_EMAIL_FROM', 'Stonelam Sales Bot <onboarding@resend.dev>')
+// Not through env(): its <> trimming would break the "Name <address>" form
+const ALERT_EMAIL_FROM = (Deno.env.get('ALERT_EMAIL_FROM') ?? '').trim() || 'Stonelam Sales Bot <onboarding@resend.dev>'
 const WEB_APP_URL = env('WEB_APP_URL', 'https://sales-assistant-hub-1svt.vercel.app').replace(/\/$/, '')
 
 const EMBED_MODEL = 'gemini-embedding-001'
@@ -88,9 +89,12 @@ const askerLabel = (askedBy: string | null, emails: Record<string, string>) =>
 
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!))
 
+let lastEmailError = ''
+
 async function sendEmail(subject: string, html: string): Promise<boolean> {
   if (!RESEND_API_KEY || ALERT_EMAILS.length === 0) {
-    console.error('[Notify] email skipped: RESEND_API_KEY or ALERT_EMAIL_TO not set')
+    lastEmailError = 'RESEND_API_KEY or ALERT_EMAIL_TO not set'
+    console.error('[Notify] email skipped:', lastEmailError)
     return false
   }
   try {
@@ -103,7 +107,8 @@ async function sendEmail(subject: string, html: string): Promise<boolean> {
     if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`)
     return true
   } catch (e) {
-    console.error('[Notify] email failed:', (e as Error).message)
+    lastEmailError = (e as Error).message
+    console.error('[Notify] email failed:', lastEmailError)
     return false
   }
 }
@@ -130,7 +135,7 @@ async function notify(id: number) {
       body: JSON.stringify({ status: 'forwarded', expert: ALERT_EMAILS.join(',') }),
     }, 'return=minimal')
   }
-  return { emailed }
+  return { emailed, error: emailed ? undefined : lastEmailError }
 }
 
 // ── Saving an answer ─────────────────────────────────────
@@ -212,6 +217,8 @@ Deno.serve(async (req: Request) => {
       if (!NOTIFY_SECRET || req.headers.get('X-Notify-Secret') !== NOTIFY_SECRET) return json({ error: 'forbidden' }, 403)
       const { id } = await req.json().catch(() => ({}))
       if (!id) return json({ error: 'id required' }, 400)
+      // ?wait=1 answers with the outcome, for checking the email setup
+      if (url.searchParams.get('wait')) return json(await notify(Number(id)))
       const work = notify(Number(id)).catch((e) => console.error('[Notify] failed:', e))
       if (typeof EdgeRuntime !== 'undefined') EdgeRuntime.waitUntil(work)
       else await work
